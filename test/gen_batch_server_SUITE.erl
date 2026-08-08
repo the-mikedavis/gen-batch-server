@@ -51,6 +51,9 @@ all_tests() ->
      flush_mailbox_on_terminate_disabled,
      flush_mailbox_on_terminate_enabled,
      aimd_batch_size_growth,
+     demand_following_batch_size_growth,
+     demand_following_env_batch_size_growth,
+     demand_following_env_retunable_without_restart,
      send_request_receive_response,
      send_request_wait_response,
      send_request_check_response,
@@ -642,6 +645,93 @@ collect_batch_sizes(Acc) ->
     after 0 ->
               lists:reverse(Acc)
     end.
+
+demand_following_batch_size_growth(Config) ->
+    %% Smoke test: {demand_following, Alpha, Headroom} runs without
+    %% crashing across both the growth and shrink branches.
+    Mod = ?config(mod, Config),
+    Self = self(),
+    meck:new(Mod, [non_strict]),
+    meck:expect(Mod, init, fun(_) -> {ok, #{}} end),
+    meck:expect(Mod, handle_batch,
+                fun(Ops, State) ->
+                        Self ! {batch_size, length(Ops)},
+                        {ok, State}
+                end),
+    Opts = [{min_batch_size, 32},
+            {max_batch_size, 8192},
+            {batch_size_growth, {demand_following, 0.3, 1.2}}],
+    {ok, Pid} = gen_batch_server:start_link(undefined, Mod, [], Opts),
+    [gen_batch_server:cast(Pid, I) || I <- lists:seq(1, 500)],
+    timer:sleep(20),
+    gen_batch_server:cast(Pid, lone_cast),
+    timer:sleep(20),
+    ?assert(is_process_alive(Pid)),
+    ?assert(meck:validate(Mod)),
+    ok.
+
+demand_following_env_batch_size_growth(Config) ->
+    %% Smoke test: the app-env-backed variant resolves defaults and runs
+    %% without crashing when the keys are unset.
+    Mod = ?config(mod, Config),
+    Self = self(),
+    meck:new(Mod, [non_strict]),
+    meck:expect(Mod, init, fun(_) -> {ok, #{}} end),
+    meck:expect(Mod, handle_batch,
+                fun(Ops, State) ->
+                        Self ! {batch_size, length(Ops)},
+                        {ok, State}
+                end),
+    application:unset_env(kernel, gbs_test_alpha),
+    application:unset_env(kernel, gbs_test_headroom),
+    Opts = [{min_batch_size, 32},
+            {max_batch_size, 8192},
+            {batch_size_growth,
+             {demand_following_env, kernel,
+              gbs_test_alpha, gbs_test_headroom, 0.3, 1.2}}],
+    {ok, Pid} = gen_batch_server:start_link(undefined, Mod, [], Opts),
+    [gen_batch_server:cast(Pid, I) || I <- lists:seq(1, 500)],
+    timer:sleep(20),
+    gen_batch_server:cast(Pid, lone_cast),
+    timer:sleep(20),
+    ?assert(is_process_alive(Pid)),
+    ?assert(meck:validate(Mod)),
+    ok.
+
+demand_following_env_retunable_without_restart(Config) ->
+    %% application:set_env/3 must be re-read on the next batch decision,
+    %% with no process restart. Retune alpha to 1.0 (EWMA = latest
+    %% batch_count exactly) and headroom to 0.0 (next shrink-branch size
+    %% always clamps to min_batch_size); confirm a round after the retune
+    %% goes through the demand_following_env code path without crashing.
+    Mod = ?config(mod, Config),
+    Self = self(),
+    meck:new(Mod, [non_strict]),
+    meck:expect(Mod, init, fun(_) -> {ok, #{}} end),
+    meck:expect(Mod, handle_batch,
+                fun(Ops, State) ->
+                        Self ! {batch_size, length(Ops)},
+                        {ok, State}
+                end),
+    application:unset_env(kernel, gbs_test_alpha),
+    application:unset_env(kernel, gbs_test_headroom),
+    Opts = [{min_batch_size, 32},
+            {max_batch_size, 8192},
+            {batch_size_growth,
+             {demand_following_env, kernel,
+              gbs_test_alpha, gbs_test_headroom, 0.3, 1.2}}],
+    {ok, Pid} = gen_batch_server:start_link(undefined, Mod, [], Opts),
+    [gen_batch_server:cast(Pid, I) || I <- lists:seq(1, 100)],
+    timer:sleep(20),
+    application:set_env(kernel, gbs_test_alpha, 1.0),
+    application:set_env(kernel, gbs_test_headroom, 0.0),
+    [gen_batch_server:cast(Pid, I) || I <- lists:seq(1, 100)],
+    timer:sleep(20),
+    ?assert(is_process_alive(Pid)),
+    application:unset_env(kernel, gbs_test_alpha),
+    application:unset_env(kernel, gbs_test_headroom),
+    ?assert(meck:validate(Mod)),
+    ok.
 
 flush_mailbox_on_terminate_disabled(Config) ->
     %% Default behaviour: flush_mailbox_on_terminate is false, so no

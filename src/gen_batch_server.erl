@@ -69,14 +69,27 @@
                  hibernate_after = infinity :: non_neg_integer() | infinity,
                  reversed_batch = false :: boolean(),
                  flush_mailbox_on_terminate = false :: false | {true, non_neg_integer()},
-                 batch_size_growth = exponential :: exponential | {aimd, pos_integer()}}).
+                 batch_size_growth = exponential :: exponential
+                                                  | {aimd, pos_integer()}
+                                                  | {demand_following, float(), float()}
+                                                  | {demand_following_env,
+                                                     App :: atom(),
+                                                     AlphaKey :: atom(),
+                                                     HeadroomKey :: atom(),
+                                                     DefaultAlpha :: float(),
+                                                     DefaultHeadroom :: float()}}).
 
 -record(state, {batch = [] :: [op()],
                 batch_count = 0 :: non_neg_integer(),
                 config = #config{} :: #config{},
                 state :: term(),
                 needs_gc = false :: boolean(),
-                debug :: list()}).
+                debug :: list(),
+                %% exponential moving average of recently observed batch
+                %% sizes; only maintained when batch_size_growth is
+                %% {demand_following, _, _}. 'undefined' until seeded by
+                %% the first observation.
+                demand_ewma = undefined :: undefined | float()}).
 
 -export_type([from/0, reply_tag/0, op/0,
               action/0, server_ref/0,
@@ -169,8 +182,16 @@ init_it(Starter, Parent, Name0, Mod, {GBOpts, Args}, Options) ->
                                        ?MIN_MAX_BATCH_SIZE),
     ReverseBatch = proplists:get_value(reversed_batch, GBOpts, false),
     FlushMailbox = proplists:get_value(flush_mailbox_on_terminate, GBOpts, false),
-    BatchSizeGrowth = proplists:get_value(batch_size_growth, GBOpts,
-                                          exponential),
+    %% Resolved once here, at process start, rather than on every batch
+    %% decision. This still lets an operator retune {demand_following_env,
+    %% ...} via application:set_env/3, because the writer (or any other
+    %% gen_batch_server) is restarted per stream/session in our testing
+    %% regimen -- each new process picks up the current env values at
+    %% start. It avoids paying an ets lookup on every batch for the
+    %% lifetime of a long-running process.
+    BatchSizeGrowth = resolve_growth(
+                        proplists:get_value(batch_size_growth, GBOpts,
+                                            exponential)),
     Conf = #config{module = Mod,
                    parent = Parent,
                    name = Name,
@@ -460,17 +481,35 @@ enter_loop_batched(Msg, Parent, State0) ->
 loop_batched(#state{config = #config{batch_size = BatchSize,
                                      max_batch_size = Max,
                                      batch_size_growth = Growth} = Config,
-                    batch_count = BatchCount} = State0,
+                    batch_count = BatchCount,
+                    demand_ewma = Ewma0} = State0,
              Parent) when BatchCount >= BatchSize ->
     % complete batch after seeing batch_size writes
-    State = complete_batch(State0),
+    State1 = complete_batch(State0),
     % grow batch size according to the configured strategy
-    NewBatchSize = case Growth of
-                       exponential ->
-                           min(Max, BatchSize * 2);
-                       {aimd, Step} ->
-                           min(Max, BatchSize + Step)
-                   end,
+    {NewBatchSize, Ewma} =
+        case Growth of
+            exponential ->
+                {min(Max, BatchSize * 2), Ewma0};
+            {aimd, Step} ->
+                {min(Max, BatchSize + Step), Ewma0};
+            {demand_following, Alpha, _Headroom} ->
+                Ewma1 = update_ewma(Ewma0, BatchCount, Alpha),
+                %% a full batch only proves demand was >= BatchSize; check
+                %% whether more is already waiting so we can grow to match
+                %% observed backlog instead of guessing. This is a self
+                %% process_info/2 call (no signal is sent, no other process
+                %% or scheduler is involved), so it costs about the same as
+                %% any other BIF and is safe to call on every full batch.
+                {message_queue_len, QLen} =
+                    erlang:process_info(self(), message_queue_len),
+                Grown = case QLen of
+                            0 -> min(Max, BatchSize * 2);
+                            _ -> min(Max, BatchSize + QLen)
+                        end,
+                {Grown, Ewma1}
+        end,
+    State = State1#state{demand_ewma = Ewma},
     loop_wait(State#state{config = Config#config{batch_size = NewBatchSize}},
               Parent);
 loop_batched(#state{debug = Debug} = State0, Parent) ->
@@ -488,14 +527,52 @@ loop_batched(#state{debug = Debug} = State0, Parent) ->
                     enter_loop_batched(Msg, Parent, State0)
             end
     after 0 ->
-              State = complete_batch(State0),
-              Config = State#state.config,
-              NewBatchSize = max(Config#config.min_batch_size,
-                                 Config#config.batch_size div 2),
+              BatchCount = State0#state.batch_count,
+              State1 = complete_batch(State0),
+              Config = State1#state.config,
+              {NewBatchSize, Ewma} =
+                  case Config#config.batch_size_growth of
+                      {demand_following, Alpha, Headroom} ->
+                          Ewma1 = update_ewma(State1#state.demand_ewma,
+                                              BatchCount, Alpha),
+                          Target = round(Ewma1 * Headroom),
+                          {clamp(Config#config.min_batch_size,
+                                 Config#config.max_batch_size, Target),
+                           Ewma1};
+                      _ ->
+                          {max(Config#config.min_batch_size,
+                              Config#config.batch_size div 2),
+                           State1#state.demand_ewma}
+                  end,
+              State = State1#state{demand_ewma = Ewma},
               loop_wait(State#state{config =
                                     Config#config{batch_size = NewBatchSize}},
                         Parent)
     end.
+
+%% Application env is consulted on every batch decision (not cached), so an
+%% operator can retune alpha/headroom for a running system with
+%% application:set_env/3 and see the effect on the next batch, without a
+%% code change, release, or process restart.
+resolve_growth({demand_following_env, App, AlphaKey, HeadroomKey,
+                DefaultAlpha, DefaultHeadroom}) ->
+    Alpha = application:get_env(App, AlphaKey, DefaultAlpha),
+    Headroom = application:get_env(App, HeadroomKey, DefaultHeadroom),
+    {demand_following, Alpha, Headroom};
+resolve_growth(Growth) ->
+    Growth.
+
+update_ewma(undefined, Sample, _Alpha) ->
+    %% seed on the first observation instead of blending against an
+    %% arbitrary starting value, which would otherwise bias the estimate
+    %% until enough rounds have passed for the bias to decay
+    float(Sample);
+update_ewma(Ewma, Sample, Alpha) ->
+    Alpha * Sample + (1 - Alpha) * Ewma.
+
+clamp(Min, _Max, V) when V < Min -> Min;
+clamp(_Min, Max, V) when V > Max -> Max;
+clamp(_Min, _Max, V) -> V.
 
 terminate(Reason, #state{config = #config{module = Mod}, state = Inner}) ->
     catch Mod:terminate(Reason, Inner),
